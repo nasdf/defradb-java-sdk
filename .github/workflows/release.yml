@@ -18,8 +18,6 @@ jobs:
     uses: ./.github/workflows/build-libraries.yml
     with:
       defradb_ref: ${{ inputs.defradb_ref || '' }}
-      # Release JAR smoke tests remain disabled; Android tests still run.
-      run_desktop_tests: false
 
   publish:
     name: Attach libraries to release
