@@ -109,7 +109,8 @@ jobs:
   build-android:
     name: Build Android AAR
     needs: resolve-defradb
-    runs-on: ubuntu-22.04
+    # Match the working Android CI environment; the emulator fails to boot on 22.04.
+    runs-on: ubuntu-24.04
     steps:
       - name: Check out SDK
         uses: actions/checkout@v4
