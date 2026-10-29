@@ -1,0 +1,206 @@
+name: Build Libraries
+
+on:
+  workflow_call:
+    inputs:
+      defradb_ref:
+        description: DefraDB branch, tag, or commit (defaults to its default branch)
+        required: false
+        type: string
+        default: ''
+      run_desktop_tests:
+        description: Run the desktop JAR smoke tests
+        required: false
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  resolve-defradb:
+    name: Resolve DefraDB revision
+    runs-on: ubuntu-22.04
+    outputs:
+      sha: ${{ steps.revision.outputs.sha }}
+    steps:
+      - name: Check out DefraDB
+        uses: actions/checkout@v4
+        with:
+          repository: sourcenetwork/defradb
+          ref: ${{ inputs.defradb_ref }}
+          persist-credentials: false
+
+      # Resolve once so every platform builds the same native library revision.
+      - name: Record revision
+        id: revision
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build ${{ matrix.target }} ${{ matrix.arch }} JAR
+    needs: resolve-defradb
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: linux
+            arch: x86_64
+          - os: macos-14
+            target: macos
+            arch: arm64
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out SDK
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Check out DefraDB
+        uses: actions/checkout@v4
+        with:
+          repository: sourcenetwork/defradb
+          ref: ${{ needs.resolve-defradb.outputs.sha }}
+          path: defradb-source
+          persist-credentials: false
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: defradb-source/go.mod
+          cache: false
+
+      - name: Build library
+        run: |
+          test "$(uname -m)" = "${{ matrix.arch }}"
+          chmod +x gradlew build.sh
+          find defradb-source -name '*.sh' -exec chmod +x {} +
+          ./build.sh --defra-dir defradb-source --${{ matrix.target }}
+
+      - name: Test packaged JAR
+        if: inputs.run_desktop_tests
+        run: |
+          mkdir -p test-out
+          javac -cp build/libs/defradb.jar test/DefraTest.java -d test-out
+          java -cp build/libs/defradb.jar:test-out DefraTest
+
+      - name: Stage library files
+        env:
+          DEFRADB_SHA: ${{ needs.resolve-defradb.outputs.sha }}
+        run: |
+          mkdir -p dist
+          artifact="defradb-${{ matrix.target }}-${{ matrix.arch }}"
+          cp build/libs/defradb.jar "dist/$artifact.jar"
+          printf 'SDK commit: %s\nDefraDB commit: %s\n' \
+            "$(git rev-parse HEAD)" "$DEFRADB_SHA" > "dist/$artifact.txt"
+          cd dist
+          shasum -a 256 "$artifact.jar" > "$artifact.jar.sha256"
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: defradb-${{ matrix.target }}-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error
+
+  build-android:
+    name: Build Android AAR
+    needs: resolve-defradb
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Check out SDK
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          android: false
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: false
+
+      - name: Check out DefraDB
+        uses: actions/checkout@v4
+        with:
+          repository: sourcenetwork/defradb
+          ref: ${{ needs.resolve-defradb.outputs.sha }}
+          path: defradb-source
+          persist-credentials: false
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android NDK
+        uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: r26d
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: defradb-source/go.mod
+          cache: false
+
+      - name: Build Android library
+        env:
+          ANDROID_NDK: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          chmod +x gradlew build.sh
+          find defradb-source -name '*.sh' -exec chmod +x {} +
+          ./build.sh --defra-dir defradb-source --android
+
+      - name: Stage AAR for instrumented test module
+        run: |
+          mkdir -p androidTest/libs
+          cp build/outputs/aar/*-release.aar androidTest/libs/defradb.aar
+
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Run Android instrumented tests
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 29
+          arch: x86_64
+          disable-animations: true
+          script: cd androidTest && ../gradlew connectedAndroidTest
+
+      - name: Stage library files
+        env:
+          DEFRADB_SHA: ${{ needs.resolve-defradb.outputs.sha }}
+        run: |
+          mkdir -p dist
+          cp androidTest/libs/defradb.aar dist/defradb-release.aar
+          printf 'SDK commit: %s\nDefraDB commit: %s\n' \
+            "$(git rev-parse HEAD)" "$DEFRADB_SHA" > dist/defradb-release.txt
+          cd dist
+          shasum -a 256 defradb-release.aar > defradb-release.aar.sha256
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: defradb-android
+          path: dist/*
+          if-no-files-found: error
+
